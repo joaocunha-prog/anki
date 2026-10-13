@@ -1,0 +1,59 @@
+# XcodeGen spec: run `xcodegen generate` in this folder to create
+# AnkiiOS.xcodeproj. See README.md.
+name: AnkiiOS
+options:
+  bundleIdPrefix: io.github.ankiios
+  deploymentTarget:
+    iOS: "16.0"
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  AnkiiOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: AnkiApp
+    dependencies:
+      # built by build-rust.sh
+      - framework: build/AnkiBridge.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: libresolv.tbd
+      - sdk: libz.tbd
+      - sdk: libc++.tbd
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Anki
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDevelopmentRegion: en
+        CFBundleLocalizations: [en, pt-BR]
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # self-hosted sync servers are often plain http on the local network
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ankiios.anki
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_BITCODE: NO
+        DEAD_CODE_STRIPPING: YES

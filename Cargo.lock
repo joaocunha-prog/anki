@@ -184,6 +184,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "anki_ios_bridge"
+version = "0.0.0"
+dependencies = [
+ "anki",
+ "anki_proto",
+ "futures",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu 0.8.8",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "anki_process"
 version = "0.0.0"
 dependencies = [

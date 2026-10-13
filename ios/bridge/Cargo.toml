@@ -1,0 +1,27 @@
+[package]
+name = "anki_ios_bridge"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+description = "C/JSON bridge exposing Anki's Rust core to the iOS app"
+
+[lib]
+name = "anki_ios_bridge"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anki = { workspace = true, features = ["native-tls"] }
+anki_proto.workspace = true
+futures.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
