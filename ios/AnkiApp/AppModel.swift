@@ -12,15 +12,26 @@ struct CollectionPaths {
     var collection: URL { folder.appendingPathComponent("collection.anki2") }
     var mediaFolder: URL { folder.appendingPathComponent("collection.media") }
     var mediaDb: URL { folder.appendingPathComponent("collection.media.db2") }
+    var backups: URL { folder.appendingPathComponent("backups") }
 
     static let standard = CollectionPaths(
         folder: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     )
 }
 
-/// Shown when AnkiWeb and the device have diverged, and the user must pick a side.
+/// Asks the user to confirm a one-way sync, as the desktop app does.
 struct FullSyncPrompt: Identifiable {
+    enum Kind {
+        /// Both sides changed; the user must pick one.
+        case conflict
+        /// This device has no cards; download AnkiWeb's collection.
+        case download
+        /// AnkiWeb has no cards; upload this device's collection.
+        case upload
+    }
+
     let id = UUID()
+    let kind: Kind
     let serverMediaUsn: Int32
 }
 
@@ -35,10 +46,17 @@ final class AppModel: ObservableObject {
     @Published private(set) var isOpen = false
     @Published private(set) var auth: SyncAuth?
     @Published private(set) var isSyncing = false
+    /// True while the running sync step can be interrupted (login, full sync).
+    @Published private(set) var canAbortSync = false
     @Published private(set) var isSyncingMedia = false
+    /// Incremented when a sync may have changed the collection, so open
+    /// screens can reload.
+    @Published private(set) var syncGeneration = 0
     @Published var fullSyncPrompt: FullSyncPrompt?
     @Published var alertMessage: String?
     @Published var showLogin = false
+    /// Shown on the login screen, eg after AnkiWeb rejected the saved login.
+    @Published var loginMessage: String?
 
     @AppStorage("username") var username = ""
     /// Optional self-hosted sync server, eg http://192.168.1.2:8080/
@@ -59,11 +77,13 @@ final class AppModel: ObservableObject {
     func start() async {
         do {
             try FileManager.default.createDirectory(at: paths.mediaFolder, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: paths.backups, withIntermediateDirectories: true)
             try await backend.run([
                 "cmd": "open",
                 "collectionPath": paths.collection.path,
                 "mediaFolder": paths.mediaFolder.path,
                 "mediaDb": paths.mediaDb.path,
+                "backupFolder": paths.backups.path,
             ])
             isOpen = true
         } catch {
@@ -93,6 +113,8 @@ final class AppModel: ObservableObject {
 
     func login(username: String, password: String) async throws {
         let endpoint = customSyncServer.trimmingCharacters(in: .whitespaces)
+        canAbortSync = true
+        defer { canAbortSync = false }
         let auth = try await backend.call(SyncAuth.self, [
             "cmd": "login",
             "username": username,
@@ -100,6 +122,7 @@ final class AppModel: ObservableObject {
             "endpoint": endpoint.isEmpty ? NSNull() as Any : endpoint as Any,
         ])
         self.username = username
+        loginMessage = nil
         setAuth(auth)
         showLogin = false
         await sync()
@@ -121,7 +144,8 @@ final class AppModel: ObservableObject {
     // Syncing
     //////////////
 
-    /// Sync with AnkiWeb, prompting for login if required.
+    /// Sync with AnkiWeb, prompting for login if required. One-way syncs are
+    /// never started here; they need the user's confirmation first.
     func sync() async {
         guard let auth else {
             showLogin = true
@@ -147,14 +171,15 @@ final class AppModel: ObservableObject {
             }
             switch result.required {
             case "fullDownload":
-                // nothing on this device yet, so no need to ask
-                try await fullSync(upload: false, serverMediaUsn: result.serverMediaUsn)
+                fullSyncPrompt = FullSyncPrompt(kind: .download, serverMediaUsn: result.serverMediaUsn)
             case "fullUpload":
-                // nothing on AnkiWeb yet
-                try await fullSync(upload: true, serverMediaUsn: result.serverMediaUsn)
+                fullSyncPrompt = FullSyncPrompt(kind: .upload, serverMediaUsn: result.serverMediaUsn)
             case "fullSync":
-                fullSyncPrompt = FullSyncPrompt(serverMediaUsn: result.serverMediaUsn)
+                fullSyncPrompt = FullSyncPrompt(kind: .conflict, serverMediaUsn: result.serverMediaUsn)
+            case "noChanges":
+                monitorMediaSync()
             default:
+                syncGeneration += 1
                 monitorMediaSync()
             }
         } catch {
@@ -163,33 +188,34 @@ final class AppModel: ObservableObject {
         await refresh()
     }
 
-    /// Resolve a conflict by replacing one side with the other.
+    /// Replace one side with the other, after the user confirmed it.
     func resolveFullSync(upload: Bool, serverMediaUsn: Int32?) async {
-        guard !isSyncing else { return }
+        guard let auth, !isSyncing else { return }
         isSyncing = true
-        defer { isSyncing = false }
+        canAbortSync = true
+        defer {
+            isSyncing = false
+            canAbortSync = false
+        }
         do {
-            try await fullSync(upload: upload, serverMediaUsn: serverMediaUsn)
+            try await backend.run([
+                "cmd": "fullSync",
+                "auth": auth.json,
+                "upload": upload,
+                "serverMediaUsn": serverMediaUsn.map { $0 as Any } ?? NSNull(),
+            ])
+            lastSync = Date()
+            monitorMediaSync()
         } catch {
             handleSyncError(error)
         }
+        // the collection was reopened, even if the sync failed
+        syncGeneration += 1
         await refresh()
     }
 
     func abortSync() {
         backend.abortSync()
-    }
-
-    private func fullSync(upload: Bool, serverMediaUsn: Int32?) async throws {
-        guard let auth else { return }
-        try await backend.run([
-            "cmd": "fullSync",
-            "auth": auth.json,
-            "upload": upload,
-            "serverMediaUsn": serverMediaUsn.map { $0 as Any } ?? NSNull(),
-        ])
-        lastSync = Date()
-        monitorMediaSync()
     }
 
     private func handleSyncError(_ error: Error) {
@@ -198,8 +224,11 @@ final class AppModel: ObservableObject {
                 return
             }
             if error.isAuthError {
+                // explain on the login screen rather than in a second alert
                 logout()
+                loginMessage = error.message
                 showLogin = true
+                return
             }
         }
         alertMessage = error.localizedDescription
@@ -231,10 +260,22 @@ final class AppModel: ObservableObject {
         switch phase {
         case .background:
             // Push the day's reviews up, as the desktop app does on close.
-            let task = UIApplication.shared.beginBackgroundTask(withName: "sync")
+            // If a sync is already running, let it finish in the background.
+            let task = BackgroundTask()
+            task.id = UIApplication.shared.beginBackgroundTask(withName: "sync") { [backend] in
+                // out of time: stop what can be stopped, and let iOS suspend us
+                backend.abortSync()
+                task.end()
+            }
             Task {
-                await sync()
-                UIApplication.shared.endBackgroundTask(task)
+                if isSyncing {
+                    while isSyncing {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
+                    }
+                } else {
+                    await sync()
+                }
+                task.end()
             }
         case .active:
             if Date().timeIntervalSince(lastSync) > 5 * 60 {
@@ -251,5 +292,18 @@ final class AppModel: ObservableObject {
     func selectDeck(_ deckId: Int64) async throws {
         try await backend.run(["cmd": "selectDeck", "deckId": deckId])
         currentDeckId = deckId
+    }
+}
+
+/// A background task identifier that can be ended exactly once, from either
+/// the expiration handler or the normal completion path (both on the main thread).
+@MainActor
+private final class BackgroundTask {
+    var id = UIBackgroundTaskIdentifier.invalid
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }

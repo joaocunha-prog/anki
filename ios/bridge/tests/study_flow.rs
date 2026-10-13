@@ -77,6 +77,10 @@ fn add_study_answer_and_undo() {
     );
     assert_eq!(err["kind"], "INVALID_INPUT");
 
+    // the default deck is offered when adding, even while empty
+    let names = cmd(&bridge, json!({"cmd": "deckNames"}));
+    assert!(names.as_array().unwrap().iter().any(|d| d["id"] == deck_id));
+
     let tree = cmd(&bridge, json!({"cmd": "deckTree"}));
     let default_deck = &tree["decks"][0];
     assert_eq!(default_deck["name"], "Default");
@@ -98,6 +102,8 @@ fn add_study_answer_and_undo() {
     assert_eq!(card["buttonLabels"].as_array().unwrap().len(), 4);
     assert_eq!(card["queue"], "new");
     assert_eq!(card["hasTypeAnswer"], false);
+    assert_eq!(card["autoplay"], true);
+    assert_eq!(card["replayQuestion"], true);
 
     let answer = cmd(&bridge, json!({"cmd": "showAnswer", "cardId": card_id}));
     let answer_html = answer["answerHtml"].as_str().unwrap();
@@ -113,7 +119,9 @@ fn add_study_answer_and_undo() {
         &bridge,
         json!({"cmd": "answer", "cardId": card_id, "ease": 3, "millisecondsTaken": 1}),
     );
-    assert_eq!(err["kind"], "INVALID_INPUT");
+    assert_eq!(err["kind"], "CARD_NOT_CURRENT");
+    let err = cmd_err(&bridge, json!({"cmd": "showAnswer", "cardId": card_id}));
+    assert_eq!(err["kind"], "CARD_NOT_CURRENT");
 
     // the card is now in learning, and will be shown again shortly
     let next = cmd(&bridge, json!({"cmd": "nextCard"}));
@@ -160,7 +168,10 @@ fn type_in_the_answer() {
     );
     let html = answer["answerHtml"].as_str().unwrap();
     assert!(html.contains(r#"<div id="typeans">"#), "{html}");
-    assert!(html.contains("typeBad") || html.contains("typeMissed"), "{html}");
+    assert!(
+        html.contains("typeBad") || html.contains("typeMissed"),
+        "{html}"
+    );
     assert!(!html.contains("[[type:"));
 }
 
@@ -189,4 +200,90 @@ fn ankiweb_rejects_bad_credentials() {
         json!({"cmd": "login", "username": "nobody@example.com", "password": "wrong"}),
     );
     assert_eq!(err["kind"], "SYNC_AUTH_ERROR", "{err}");
+}
+
+/// Add a note to a notetype whose back template uses `back_template`, and
+/// return (question html, answer html) after typing `typed`.
+fn type_answer_round_trip(
+    back_field: &str,
+    front_template: &str,
+    back_template: &str,
+    typed: &str,
+) -> (Value, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = open_bridge(&dir);
+    let notetype = notetype_id(&bridge, "Basic (type in the answer)");
+    let deck_id = cmd(&bridge, json!({"cmd": "addDefaults"}))["deckId"].clone();
+    // customize the templates through the core directly
+    {
+        use anki::collection::CollectionBuilder;
+        cmd(&bridge, json!({"cmd": "close"}));
+        let mut col = CollectionBuilder::new(dir.path().join("collection.anki2"))
+            .build()
+            .unwrap();
+        let mut nt = (*col
+            .get_notetype(anki::notetype::NotetypeId(notetype))
+            .unwrap()
+            .unwrap())
+        .clone();
+        nt.templates[0].config.q_format = front_template.into();
+        nt.templates[0].config.a_format = back_template.into();
+        col.update_notetype(&mut nt, false).unwrap();
+        col.close(None).unwrap();
+    }
+    let bridge = open_bridge(&dir);
+    cmd(
+        &bridge,
+        json!({"cmd": "addNote", "notetypeId": notetype, "deckId": deck_id,
+               "fields": ["front", back_field], "tags": []}),
+    );
+    let card = cmd(&bridge, json!({"cmd": "nextCard"}))["card"].clone();
+    let answer = cmd(
+        &bridge,
+        json!({"cmd": "showAnswer", "cardId": card["cardId"], "typed": typed}),
+    );
+    (card, answer["answerHtml"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn type_answer_modifiers_and_html() {
+    // a line break in the field matches a typed space, as on the desktop
+    let (card, html) = type_answer_round_trip(
+        "red<br>green",
+        "{{Front}} {{type:Back}}",
+        "{{FrontSide}}<hr id=answer>{{Back}}",
+        "red green",
+    );
+    assert_eq!(card["hasTypeAnswer"], true);
+    assert!(html.contains("typeGood"), "{html}");
+    assert!(!html.contains("typeBad"), "{html}");
+
+    // case-insensitive comparison
+    let (_, html) = type_answer_round_trip(
+        "Paris",
+        "{{Front}} {{type:ci:Back}}",
+        "{{FrontSide}}<hr id=answer>{{Back}}",
+        "paris",
+    );
+    assert!(
+        html.contains("typeGood") && !html.contains("typeBad"),
+        "{html}"
+    );
+
+    // a tag on the back only is removed
+    let (_, html) = type_answer_round_trip(
+        "Paris",
+        "{{Front}}",
+        "{{FrontSide}}<hr id=answer>{{type:Back}}{{Back}}",
+        "",
+    );
+    assert!(!html.contains("[[type:"), "{html}");
+}
+
+#[test]
+fn empty_type_field_shows_no_input() {
+    let (card, html) = type_answer_round_trip("", "{{Front}} {{type:Back}}", "{{FrontSide}}", "");
+    assert_eq!(card["hasTypeAnswer"], false);
+    assert!(!card["questionHtml"].as_str().unwrap().contains("typeans"));
+    assert!(!html.contains("[[type:"));
 }

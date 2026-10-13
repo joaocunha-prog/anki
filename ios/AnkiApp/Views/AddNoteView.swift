@@ -85,6 +85,7 @@ struct AddNoteView: View {
                 Text(message)
             }
             .task { await load() }
+            .appPresentations(model)
         }
     }
 

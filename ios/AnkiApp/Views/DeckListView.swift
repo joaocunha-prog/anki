@@ -105,11 +105,13 @@ struct SyncButton: View {
 
     var body: some View {
         if model.isSyncing {
+            // only login and one-way syncs can be interrupted
             Button {
                 model.abortSync()
             } label: {
                 ProgressView()
             }
+            .disabled(!model.canAbortSync)
             .accessibilityLabel("Syncing")
         } else {
             Button {

@@ -103,6 +103,9 @@ struct StudyView: View {
             }
             await session.loadNextCard()
         }
+        .onChange(of: model.syncGeneration) { _ in
+            Task { await session.loadNextCard() }
+        }
         .onDisappear {
             session.stopAudio()
             Task { await model.refresh() }

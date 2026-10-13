@@ -4,10 +4,12 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use std::thread::JoinHandle;
 
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
+use anki::decks::DeckId as NativeDeckId;
 use anki::error::AnkiError;
 use anki::error::Result;
 use anki::prelude::I18n;
@@ -67,6 +69,8 @@ pub enum Command {
         collection_path: String,
         media_folder: String,
         media_db: String,
+        /// Where to save a backup before a full download replaces the collection.
+        backup_folder: Option<String>,
     },
     Close,
     Login {
@@ -142,16 +146,36 @@ impl TryFrom<AuthJson> for SyncAuth {
     }
 }
 
+/// Errors returned by commands. Most come from the core; the rest are
+/// specific to the bridge, and get their own `kind` so Swift can react.
+pub enum BridgeError {
+    Anki(AnkiError),
+    /// The card being answered is no longer the bridge's current card, eg
+    /// because a sync or undo happened in the meantime.
+    CardNotCurrent,
+}
+
+impl From<AnkiError> for BridgeError {
+    fn from(err: AnkiError) -> Self {
+        BridgeError::Anki(err)
+    }
+}
+
+/// How a `[[type:...]]` answer should be checked.
+struct TypeAnswer {
+    expected: String,
+    combining: bool,
+    ignore_case: bool,
+}
+
 /// The card currently shown to the user, kept so that the answer can be
 /// recorded without round-tripping scheduling states through Swift.
 struct CurrentCard {
     card_id: i64,
-    note_id: i64,
-    template_idx: u32,
     states: SchedulingStates,
     answer_text: String,
     answer_av: Vec<AvItem>,
-    type_field: Option<String>,
+    type_answer: Option<TypeAnswer>,
 }
 
 struct MediaSync {
@@ -167,6 +191,7 @@ pub struct Bridge {
     client: Client,
     sync_abort: Mutex<Option<AbortHandle>>,
     media_sync: Mutex<Option<MediaSync>>,
+    backup_folder: Mutex<Option<String>>,
     /// Error from the most recently finished media sync.
     media_sync_error: Arc<Mutex<Option<String>>>,
 }
@@ -186,6 +211,7 @@ impl Bridge {
             client: Client::builder().http1_only().build().expect("http client"),
             sync_abort: Mutex::new(None),
             media_sync: Mutex::new(None),
+            backup_folder: Mutex::new(None),
             media_sync_error: Default::default(),
         }
     }
@@ -202,7 +228,13 @@ impl Bridge {
         reply.to_string()
     }
 
-    fn error_json(&self, err: AnkiError) -> Value {
+    fn error_json(&self, err: BridgeError) -> Value {
+        let err = match err {
+            BridgeError::Anki(err) => err,
+            BridgeError::CardNotCurrent => {
+                return json!({"error": {"kind": "CARD_NOT_CURRENT", "message": "card is no longer current"}})
+            }
+        };
         let err = err.into_protobuf(&self.tr);
         let kind = ErrorKind::try_from(err.kind)
             .map(|k| k.as_str_name())
@@ -211,19 +243,21 @@ impl Bridge {
     }
 
     pub fn abort_sync(&self) {
-        if let Some(handle) = self.sync_abort.lock().unwrap().take() {
+        if let Some(handle) = lock(&self.sync_abort).take() {
             handle.abort();
         }
     }
 
-    pub fn run(&self, cmd: Command) -> Result<Value> {
+    pub fn run(&self, cmd: Command) -> std::result::Result<Value, BridgeError> {
         Ok(match cmd {
             Command::Open {
                 collection_path,
                 media_folder,
                 media_db,
+                backup_folder,
             } => {
-                let mut guard = self.col.lock().unwrap();
+                *lock(&self.backup_folder) = backup_folder;
+                let mut guard = lock(&self.col);
                 if guard.is_none() {
                     *guard = Some(
                         CollectionBuilder::new(collection_path)
@@ -236,8 +270,8 @@ impl Bridge {
             }
             Command::Close => {
                 self.stop_media_sync();
-                self.current.lock().unwrap().take();
-                if let Some(col) = self.col.lock().unwrap().take() {
+                lock(&self.current).take();
+                if let Some(col) = lock(&self.col).take() {
                     col.close(None)?;
                 }
                 Value::Null
@@ -272,7 +306,7 @@ impl Bridge {
             }
             Command::MediaSyncStatus => {
                 let active = self.media_sync_active();
-                let error = self.media_sync_error.lock().unwrap().clone();
+                let error = lock(&self.media_sync_error).clone();
                 json!({ "active": active, "error": error })
             }
             Command::DeckTree => self.with_col(|col| {
@@ -292,7 +326,7 @@ impl Bridge {
                 let names = DecksService::get_deck_names(
                     col,
                     GetDeckNamesRequest {
-                        skip_empty_default: true,
+                        skip_empty_default: false,
                         include_filtered: false,
                     },
                 )?;
@@ -305,7 +339,7 @@ impl Bridge {
                 ))
             })?,
             Command::SelectDeck { deck_id } => {
-                self.current.lock().unwrap().take();
+                lock(&self.current).take();
                 self.with_col(|col| {
                     DecksService::set_current_deck(col, DeckId { did: deck_id }).map(|_| ())
                 })?;
@@ -322,7 +356,7 @@ impl Bridge {
                 Value::Null
             }
             Command::Undo => {
-                self.current.lock().unwrap().take();
+                lock(&self.current).take();
                 let out = self.with_col(CollectionService::undo)?;
                 json!({ "operation": out.operation })
             }
@@ -384,7 +418,7 @@ impl Bridge {
     }
 
     fn lock_col(&self) -> Result<MutexGuard<'_, Option<Collection>>> {
-        let guard = self.col.lock().unwrap();
+        let guard = lock(&self.col);
         if guard.is_none() {
             return Err(AnkiError::CollectionNotOpen);
         }
@@ -394,9 +428,9 @@ impl Bridge {
     /// Block on a future, allowing it to be interrupted with [Self::abort_sync].
     fn abortable<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         let (handle, reg) = AbortHandle::new_pair();
-        self.sync_abort.lock().unwrap().replace(handle);
+        lock(&self.sync_abort).replace(handle);
         let result = self.runtime.block_on(Abortable::new(fut, reg));
-        self.sync_abort.lock().unwrap().take();
+        lock(&self.sync_abort).take();
         result.unwrap_or(Err(AnkiError::Interrupted))
     }
 
@@ -421,7 +455,7 @@ impl Bridge {
         let deck_name = DecksService::get_current_deck(col)?.name;
 
         let Some(qc) = queued.cards.into_iter().next() else {
-            self.current.lock().unwrap().take();
+            lock(&self.current).take();
             let info = SchedulerService::congrats_info(col)?;
             return Ok(json!({
                 "card": null,
@@ -434,7 +468,7 @@ impl Bridge {
                     "newRemaining": info.new_remaining,
                     "haveUserBuried": info.have_user_buried,
                     "haveSchedBuried": info.have_sched_buried,
-                    "deckDescription": info.deck_description,
+                    "deckDescription": anki::text::html_to_text_line(&info.deck_description, false),
                 }
             }));
         };
@@ -463,13 +497,33 @@ impl Bridge {
                 question_side: false,
             },
         )?;
-        let type_field = render::type_answer_field(&question.text);
         let mut question_html = render::av_refs_to_play_buttons(&question.text);
-        if type_field.is_some() {
-            question_html = render::type_tag_to_input(&question_html);
+        let mut type_answer = None;
+        if let Some(spec) = render::type_answer_field(&question_html) {
+            match self.resolve_type_answer(col, card.note_id, card.template_idx, &spec)? {
+                Ok(Some(ta)) => {
+                    question_html = render::type_tag_to_input(&question_html);
+                    type_answer = Some(ta);
+                }
+                // empty field: nothing to type
+                Ok(None) => question_html = render::replace_type_tag(&question_html, ""),
+                Err(message) => question_html = render::replace_type_tag(&question_html, &message),
+            }
         }
         let question_html = CardRenderingService::encode_iri_paths(col, question_html.into())?.val;
         let button_labels = SchedulerService::describe_next_states(col, states.clone())?.vals;
+        let home_deck = if card.original_deck_id != 0 {
+            card.original_deck_id
+        } else {
+            card.deck_id
+        };
+        let config = match col
+            .get_deck(NativeDeckId(home_deck))?
+            .and_then(|deck| deck.config_id())
+        {
+            Some(dcid) => col.get_deck_config(dcid, true)?.unwrap_or_default(),
+            None => Default::default(),
+        };
         let queue = match Queue::try_from(qc.queue).unwrap_or(Queue::New) {
             Queue::New => "new",
             Queue::Learning => "learn",
@@ -485,66 +539,82 @@ impl Bridge {
                 "ord": card.template_idx,
                 "queue": queue,
                 "buttonLabels": button_labels,
-                "hasTypeAnswer": type_field.is_some(),
+                "hasTypeAnswer": type_answer.is_some(),
+                "autoplay": !config.inner.disable_autoplay,
+                "replayQuestion": !config.inner.skip_question_when_replaying_answer,
             },
             "counts": counts,
             "deckName": deck_name,
             "congrats": null,
         });
-        *self.current.lock().unwrap() = Some(CurrentCard {
+        *lock(&self.current) = Some(CurrentCard {
             card_id: card.id,
-            note_id: card.note_id,
-            template_idx: card.template_idx,
             states,
             answer_text: answer.text,
             answer_av: render::av_tags_to_items(answer.av_tags),
-            type_field,
+            type_answer,
         });
         Ok(reply)
     }
 
-    fn show_answer(&self, card_id: i64, typed: Option<String>) -> Result<Value> {
-        let current = self.current.lock().unwrap();
-        let Some(current) = current.as_ref().filter(|c| c.card_id == card_id) else {
-            anki::invalid_input!("card is no longer current");
-        };
+    fn show_answer(
+        &self,
+        card_id: i64,
+        typed: Option<String>,
+    ) -> std::result::Result<Value, BridgeError> {
+        // lock order: col before current
         let mut guard = self.lock_col()?;
         let col = guard.as_mut().unwrap();
+        let current = lock(&self.current);
+        let Some(current) = current.as_ref().filter(|c| c.card_id == card_id) else {
+            return Err(BridgeError::CardNotCurrent);
+        };
         let mut text = render::av_refs_to_play_buttons(&current.answer_text);
-        if let Some(field) = &current.type_field {
-            let comparison = self.type_answer_comparison(
-                col,
-                current,
-                field,
-                typed.as_deref().unwrap_or_default(),
-            )?;
-            text = render::replace_type_tag(&text, &comparison);
-        }
+        let comparison = match &current.type_answer {
+            Some(ta) => {
+                let html = CardRenderingService::compare_answer(
+                    col,
+                    CompareAnswerRequest {
+                        expected: ta.expected.clone(),
+                        provided: typed.unwrap_or_default(),
+                        combining: ta.combining,
+                        ignore_case: ta.ignore_case,
+                    },
+                )?
+                .val;
+                format!(r#"<div id="typeans">{html}</div>"#)
+            }
+            None => String::new(),
+        };
+        text = render::replace_type_tag(&text, &comparison);
         let html = CardRenderingService::encode_iri_paths(col, text.into())?.val;
         Ok(json!({ "answerHtml": html, "answerAv": current.answer_av }))
     }
 
-    fn type_answer_comparison(
+    /// Work out what a `[[type:...]]` tag expects, as the desktop reviewer
+    /// does. Returns Ok(None) if the field is empty, and Err(message) if the
+    /// field does not exist.
+    fn resolve_type_answer(
         &self,
         col: &mut Collection,
-        current: &CurrentCard,
-        field: &str,
-        provided: &str,
-    ) -> Result<String> {
-        let (field, combining) = match field.strip_prefix("nc:") {
-            Some(rest) => (rest, false),
-            None => (field, true),
-        };
-        let (field, cloze) = match field.strip_prefix("cloze:") {
-            Some(rest) => (rest, true),
-            None => (field, false),
-        };
-        let note = NotesService::get_note(
-            col,
-            NoteId {
-                nid: current.note_id,
-            },
-        )?;
+        note_id: i64,
+        template_idx: u32,
+        spec: &str,
+    ) -> Result<std::result::Result<Option<TypeAnswer>, String>> {
+        // modifiers come before the field name, eg "cloze:nc:ci:Text"
+        let (modifiers, field) = spec.rsplit_once(':').unwrap_or(("", spec));
+        let mut cloze = false;
+        let mut combining = true;
+        let mut ignore_case = false;
+        for modifier in modifiers.split(':') {
+            match modifier {
+                "cloze" => cloze = true,
+                "nc" => combining = false,
+                "ci" => ignore_case = true,
+                _ => {}
+            }
+        }
+        let note = NotesService::get_note(col, NoteId { nid: note_id })?;
         let names = NotetypesService::get_field_names(
             col,
             NotetypeId {
@@ -552,7 +622,10 @@ impl Bridge {
             },
         )?;
         let Some(idx) = names.vals.iter().position(|n| n == field) else {
-            return Ok(format!("(type answer: unknown field {field})"));
+            return Ok(Err(self
+                .tr
+                .studying_type_answer_unknown_field(field.to_string())
+                .into_owned()));
         };
         let mut expected = note.fields[idx].clone();
         if cloze {
@@ -560,29 +633,31 @@ impl Bridge {
                 col,
                 ExtractClozeForTypingRequest {
                     text: expected,
-                    ordinal: current.template_idx + 1,
+                    ordinal: template_idx + 1,
                 },
             )?
             .val;
         }
-        let expected = render::strip_sound_refs(&anki::text::strip_html(&expected));
-        let html = CardRenderingService::compare_answer(
-            col,
-            CompareAnswerRequest {
-                expected,
-                provided: provided.to_string(),
-                combining,
-                ignore_case: false,
-            },
-        )?
-        .val;
-        Ok(format!(r#"<div id="typeans">{html}</div>"#))
+        if expected.trim().is_empty() {
+            return Ok(Ok(None));
+        }
+        // compare_answer strips HTML and media references itself
+        Ok(Ok(Some(TypeAnswer {
+            expected,
+            combining,
+            ignore_case,
+        })))
     }
 
-    fn answer(&self, card_id: i64, ease: u8, milliseconds_taken: u32) -> Result<()> {
-        let current = self.current.lock().unwrap().take();
+    fn answer(
+        &self,
+        card_id: i64,
+        ease: u8,
+        milliseconds_taken: u32,
+    ) -> std::result::Result<(), BridgeError> {
+        let current = lock(&self.current).take();
         let Some(current) = current.filter(|c| c.card_id == card_id) else {
-            anki::invalid_input!("card is no longer current");
+            return Err(BridgeError::CardNotCurrent);
         };
         let states = current.states;
         let (rating, new_state) = match ease {
@@ -590,7 +665,7 @@ impl Bridge {
             2 => (Rating::Hard, states.hard),
             3 => (Rating::Good, states.good),
             4 => (Rating::Easy, states.easy),
-            _ => anki::invalid_input!("invalid ease"),
+            _ => return Err(invalid("invalid ease").into()),
         };
         self.with_col(|col| {
             SchedulerService::answer_card(
@@ -610,7 +685,7 @@ impl Bridge {
     }
 
     fn bury_or_suspend(&self, card_id: i64, mode: BuryOrSuspendMode) -> Result<Value> {
-        self.current.lock().unwrap().take();
+        lock(&self.current).take();
         self.with_col(|col| {
             // ensure card exists before acting on it
             let _card = CardsService::get_card(col, CardId { cid: card_id })?;
@@ -632,7 +707,6 @@ impl Bridge {
 
     fn normal_sync(&self, auth: AuthJson, sync_media: bool) -> Result<Value> {
         let sync_auth: SyncAuth = auth.clone().try_into()?;
-        self.current.lock().unwrap().take();
         let output = {
             let mut guard = self.lock_col()?;
             let col = guard.as_mut().unwrap();
@@ -644,6 +718,10 @@ impl Bridge {
         };
         let full_sync_required =
             matches!(output.required, SyncActionRequired::FullSyncRequired { .. });
+        if !matches!(output.required, SyncActionRequired::NoChanges) {
+            // the card may have been changed on another device
+            lock(&self.current).take();
+        }
         let resp = SyncCollectionResponse::from(output);
         if sync_media && !full_sync_required {
             self.start_media_sync(auth, Some(Usn(resp.server_media_usn)))?;
@@ -667,8 +745,17 @@ impl Bridge {
     fn full_sync(&self, auth: AuthJson, upload: bool) -> Result<()> {
         let auth: SyncAuth = auth.try_into()?;
         self.stop_media_sync();
-        self.current.lock().unwrap().take();
+        lock(&self.current).take();
         let mut guard = self.lock_col()?;
+        if !upload {
+            // like the desktop, keep a copy of what is about to be replaced
+            if let Some(folder) = lock(&self.backup_folder).clone() {
+                let col = guard.as_mut().unwrap();
+                if let Some(task) = col.maybe_backup(folder, true)? {
+                    task.join().map_err(|_| invalid("backup failed"))??;
+                }
+            }
+        }
         let col = guard.take().unwrap();
         let mut builder = col.as_builder();
         let result = if upload {
@@ -692,7 +779,7 @@ impl Bridge {
         let handle = self.runtime.handle().clone();
         let client = self.client.clone();
         let error_slot = self.media_sync_error.clone();
-        error_slot.lock().unwrap().take();
+        lock(&error_slot).take();
         let thread = std::thread::spawn(move || {
             let fut = mgr.sync_media(progress, auth, client, server_usn);
             let result = handle
@@ -700,17 +787,17 @@ impl Bridge {
                 .unwrap_or(Err(AnkiError::Interrupted));
             if let Err(err) = &result {
                 if !matches!(err, AnkiError::Interrupted) {
-                    error_slot.lock().unwrap().replace(err.to_string());
+                    lock(&error_slot).replace(err.to_string());
                 }
             }
             result
         });
-        *self.media_sync.lock().unwrap() = Some(MediaSync { abort, thread });
+        *lock(&self.media_sync) = Some(MediaSync { abort, thread });
         Ok(())
     }
 
     fn media_sync_active(&self) -> bool {
-        let mut guard = self.media_sync.lock().unwrap();
+        let mut guard = lock(&self.media_sync);
         match &*guard {
             Some(sync) if !sync.thread.is_finished() => true,
             Some(_) => {
@@ -724,7 +811,7 @@ impl Bridge {
 
     /// Abort any running media sync, and wait for it to finish.
     fn stop_media_sync(&self) {
-        if let Some(sync) = self.media_sync.lock().unwrap().take() {
+        if let Some(sync) = lock(&self.media_sync).take() {
             sync.abort.abort();
             let _ = sync.thread.join();
         }
@@ -749,8 +836,20 @@ fn deck_node_json(node: &DeckTreeNode) -> Value {
 impl Drop for Bridge {
     fn drop(&mut self) {
         self.stop_media_sync();
-        if let Some(col) = self.col.lock().unwrap().take() {
+        if let Some(col) = lock(&self.col).take() {
             let _ = col.close(None);
         }
+    }
+}
+
+/// Lock a mutex, ignoring poisoning: a panic is caught at the FFI boundary,
+/// and later commands should still be able to run.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn invalid(message: &str) -> AnkiError {
+    AnkiError::InvalidInput {
+        source: snafu::FromString::without_source(message.to_string()),
     }
 }

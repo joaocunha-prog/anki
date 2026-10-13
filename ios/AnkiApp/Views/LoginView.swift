@@ -72,6 +72,9 @@ struct LoginView: View {
                 if username.isEmpty {
                     username = model.username
                 }
+                if errorMessage == nil {
+                    errorMessage = model.loginMessage
+                }
             }
         }
     }

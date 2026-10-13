@@ -59,3 +59,5 @@
 "Your changes on this device and on AnkiWeb conflict. Which copy do you want to keep?" = "As alterações neste dispositivo e no AnkiWeb estão em conflito. Qual cópia você quer manter?";
 "Your collection is stored in the app's Documents folder, accessible from the Files app." = "Sua coleção fica na pasta Documentos do app, acessível pelo app Arquivos.";
 "Your collection will be synced with AnkiWeb, so you can study on your other devices too." = "Sua coleção será sincronizada com o AnkiWeb, para você estudar também nos seus outros dispositivos.";
+"This device has no cards. Replace it with your AnkiWeb collection?" = "Este dispositivo não tem cartões. Substituí-lo pela sua coleção do AnkiWeb?";
+"AnkiWeb has no cards. Replace it with this device's collection?" = "O AnkiWeb não tem cartões. Substituí-lo pela coleção deste dispositivo?";

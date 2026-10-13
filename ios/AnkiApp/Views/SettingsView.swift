@@ -8,7 +8,6 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmUpload = false
     @State private var confirmDownload = false
-    @State private var showLogin = false
     @AppStorage("autoSync") private var autoSync = true
     @AppStorage("customSyncServer") private var customSyncServer = ""
 
@@ -28,7 +27,7 @@ struct SettingsView: View {
                         }
                     } else {
                         Button("Log In") {
-                            showLogin = true
+                            model.showLogin = true
                         }
                     }
                 }
@@ -67,10 +66,7 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .sheet(isPresented: $showLogin) {
-                LoginView()
-                    .environmentObject(model)
-            }
+            .appPresentations(model)
             .confirmationDialog("Replace AnkiWeb's copy with this device's collection?", isPresented: $confirmUpload, titleVisibility: .visible) {
                 Button("Upload", role: .destructive) {
                     Task { await model.resolveFullSync(upload: true, serverMediaUsn: nil) }

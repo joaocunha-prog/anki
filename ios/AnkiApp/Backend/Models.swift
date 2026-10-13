@@ -69,6 +69,10 @@ struct QueuedCard: Decodable {
     /// Intervals for again/hard/good/easy
     let buttonLabels: [String]
     let hasTypeAnswer: Bool
+    /// From the deck's options: play audio automatically
+    let autoplay: Bool
+    /// From the deck's options: replay the question's audio with the answer
+    let replayQuestion: Bool
 }
 
 struct Congrats: Decodable {

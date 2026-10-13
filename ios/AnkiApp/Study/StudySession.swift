@@ -49,7 +49,11 @@ final class StudySession: ObservableObject {
                 bodyHtml = card.questionHtml
                 phase = .question
                 shownAt = Date()
-                audio.play(questionAv)
+                if card.autoplay {
+                    audio.play(questionAv)
+                } else {
+                    audio.stop()
+                }
             } else {
                 questionAv = []
                 bodyHtml = ""
@@ -74,9 +78,13 @@ final class StudySession: ObservableObject {
             answerAv = answer.answerAv
             bodyHtml = answer.answerHtml
             phase = .answer
-            audio.play(answerAv)
+            if card.autoplay {
+                audio.play(answerAv)
+            } else {
+                audio.stop()
+            }
         } catch {
-            errorMessage = error.localizedDescription
+            await handle(error)
         }
     }
 
@@ -95,7 +103,8 @@ final class StudySession: ObservableObject {
                 "millisecondsTaken": millis,
             ])
         } catch {
-            errorMessage = error.localizedDescription
+            await handle(error)
+            return
         }
         await loadNextCard()
     }
@@ -128,7 +137,21 @@ final class StudySession: ObservableObject {
     }
 
     func replay() {
-        audio.play(phase == .answer ? answerAv : questionAv)
+        if phase == .answer {
+            audio.play((card?.replayQuestion ?? true ? questionAv : []) + answerAv)
+        } else {
+            audio.play(questionAv)
+        }
+    }
+
+    /// If the card changed underneath us (eg a sync), show the up-to-date
+    /// card instead of an error.
+    private func handle(_ error: Error) async {
+        if let error = error as? BackendError, error.isCardNotCurrent {
+            await loadNextCard()
+        } else {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func play(side: String, index: Int) {

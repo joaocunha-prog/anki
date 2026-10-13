@@ -12,6 +12,8 @@ struct BackendError: LocalizedError {
     var errorDescription: String? { message }
     var isAuthError: Bool { kind == "SYNC_AUTH_ERROR" }
     var isInterrupted: Bool { kind == "INTERRUPTED" }
+    /// The card on screen was changed elsewhere (eg by a sync), and must be reloaded.
+    var isCardNotCurrent: Bool { kind == "CARD_NOT_CURRENT" }
 }
 
 /// Thin async wrapper around the C/JSON bridge. Commands are executed one at

@@ -49,7 +49,8 @@ pub unsafe extern "C" fn anki_bridge_new(langs: *const c_char) -> *mut Bridge {
 #[no_mangle]
 pub unsafe extern "C" fn anki_bridge_free(bridge: *mut Bridge) {
     if !bridge.is_null() {
-        drop(Box::from_raw(bridge));
+        // a panic must not unwind across the FFI boundary
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(bridge))));
     }
 }
 
@@ -79,7 +80,8 @@ pub unsafe extern "C" fn anki_bridge_command(
 /// `bridge` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn anki_bridge_abort_sync(bridge: *const Bridge) {
-    (*bridge).abort_sync();
+    let bridge = &*bridge;
+    let _ = catch_unwind(AssertUnwindSafe(|| bridge.abort_sync()));
 }
 
 /// Free a string returned by [anki_bridge_command].
