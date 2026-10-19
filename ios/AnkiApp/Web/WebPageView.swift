@@ -64,6 +64,14 @@ struct WebPageView: UIViewRepresentable {
     var onCollectionChanged: () -> Void = {}
     /// The page asked to show a search in the browser.
     var onSearchInBrowser: (String) -> Void = { _ in }
+    /// Extra POST /_anki/<method> handlers for this page, checked before the
+    /// built-in ones (eg the editor's handlers that the desktop implements
+    /// in Python).
+    var extraPostHandlers: [String: WebPostHandler] = [:]
+    /// bridgeCommand()/pycmd() messages other than "browserSearch:".
+    var onBridgeCommand: (String) -> Void = { _ in }
+    /// Extra scripts run at document end, after the styling script.
+    var extraUserScripts: [String] = []
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -73,6 +81,7 @@ struct WebPageView: UIViewRepresentable {
         let coordinator = context.coordinator
         let handler = AnkiWebSchemeHandler(backend: backend, mediaFolder: mediaFolder)
         handler.host = coordinator
+        handler.extraPostHandlers = extraPostHandlers
         coordinator.schemeHandler = handler
 
         let config = WKWebViewConfiguration()
@@ -87,6 +96,11 @@ struct WebPageView: UIViewRepresentable {
         controller.addUserScript(
             WKUserScript(source: Self.stylingScript(night: night), injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         )
+        for script in extraUserScripts {
+            controller.addUserScript(
+                WKUserScript(source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+            )
+        }
         controller.add(WeakScriptMessageHandler(coordinator), name: Self.bridgeName)
 
         let webView = WKWebView(frame: .zero, configuration: config)
@@ -108,6 +122,7 @@ struct WebPageView: UIViewRepresentable {
     func updateUIView(_ webView: WKWebView, context: Context) {
         let coordinator = context.coordinator
         coordinator.parent = self
+        coordinator.schemeHandler?.extraPostHandlers = extraPostHandlers
         bindProxy(coordinator: coordinator, webView: webView)
         if coordinator.loadedPath != path,
            let url = AnkiWebSchemeHandler.url(for: path, night: context.environment.colorScheme == .dark)
@@ -320,6 +335,8 @@ struct WebPageView: UIViewRepresentable {
             if command.hasPrefix(browserSearch) {
                 let search = command.dropFirst(browserSearch.count).trimmingCharacters(in: .whitespaces)
                 parent.onSearchInBrowser(search)
+            } else {
+                parent.onBridgeCommand(command)
             }
         }
 

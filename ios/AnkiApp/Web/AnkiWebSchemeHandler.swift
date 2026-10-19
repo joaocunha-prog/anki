@@ -63,6 +63,11 @@ protocol AnkiWebHost: AnyObject {
 ///   Add them to `postHandler(for:)` when the page that needs them is used.
 /// - also not replicated: /_anki/legacyPageData, /_addons/, and the
 ///   op-changes refresh, which is reduced to webPageDidChangeCollection().
+/// A handler for POST /_anki/<method>, given the request's protobuf bytes.
+/// Screens that open a page can add their own (see
+/// `WebPageView.extraPostHandlers`), eg for the editor's Python handlers.
+typealias WebPostHandler = @MainActor (Data) async throws -> Data
+
 @MainActor
 final class AnkiWebSchemeHandler: NSObject, WKURLSchemeHandler {
     static let scheme = "anki-web"
@@ -412,13 +417,19 @@ final class AnkiWebSchemeHandler: NSObject, WKURLSchemeHandler {
         }
     }
 
-    private typealias PostHandler = @MainActor (Data) async throws -> Data
+    private typealias PostHandler = WebPostHandler
+
+    /// Handlers added by the screen showing the page; checked first.
+    var extraPostHandlers: [String: WebPostHandler] = [:]
 
     /// The handler for POST /_anki/<method>: one of the desktop's Python
     /// handlers (post_handler_list in mediasrv.py) that is replicated here,
     /// or a backend method the desktop exposes (exposed_backend_list).
     private func postHandler(for method: String) -> PostHandler? {
         let backend = self.backend
+        if let extra = extraPostHandlers[method] {
+            return extra
+        }
         switch method {
         case "getConfigJson":
             // The desktop returns null for missing keys.
