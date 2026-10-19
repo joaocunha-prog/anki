@@ -3,6 +3,7 @@
 
 pub mod python;
 pub mod rust;
+pub mod swift;
 pub mod typescript;
 
 use anki_proto_gen::descriptors_path;
@@ -16,6 +17,7 @@ fn main() -> Result<()> {
     let (_, services) = get_services(&pool);
     python::write_python_interface(&services)?;
     typescript::write_ts_interface(&services)?;
+    swift::write_swift_interface(&pool, &services)?;
 
     Ok(())
 }
