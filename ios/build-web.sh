@@ -33,7 +33,7 @@ DEST=${WEB_OUT:-"$ROOT/ios/build/web"}
 
 if [ "${SKIP_WEB_BUILD:-}" != "1" ]; then
     # Translations are needed to build the pages.
-    if [ ! -f ftl/core-repo/core/sync.ftl ]; then
+    if [ ! -f ftl/core-repo/l10n.toml ] || [ ! -f ftl/qt-repo/l10n.toml ]; then
         git submodule update --init --depth 1 ftl/core-repo ftl/qt-repo
     fi
     if ! command -v just > /dev/null; then
