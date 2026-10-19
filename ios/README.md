@@ -43,8 +43,19 @@ ios/
 └── project.yml      especificação XcodeGen do projeto Xcode
 ```
 
-O Swift chama `anki_bridge_command(bridge, "{\"cmd\": \"nextCard\"}")` e recebe
-`{"ok": ...}` ou `{"error": {"kind": ..., "message": ...}}`. A senha do AnkiWeb
+A ponte expõe duas interfaces sobre o mesmo `anki::backend::Backend` (uma única
+coleção aberta):
+
+- `anki_bridge_rpc(bridge, service, method, bytes, len)` → `AnkiBuffer`: acesso a todos
+  os serviços protobuf do núcleo, como no Python/TypeScript. Em erro, `is_error` vem
+  `true` e os bytes são um `BackendError`; `data` é NULL quando `len` é 0. O Swift usa
+  o código gerado em `out/ios/generated/` (`BackendServices.swift` + `*.pb.swift`).
+- `anki_bridge_command(bridge, "{\"cmd\": \"nextCard\"}")` → `{"ok": ...}` ou
+  `{"error": {"kind": ..., "message": ...}}`: comandos JSON do revisor e da sincronização.
+
+As telas web do Anki (`ts/routes`: opções do baralho, estatísticas, editor...) são
+compiladas por `ios/build-web.sh`, embutidas em `web/` e servidas pelo esquema
+`anki-web://`, que encaminha as chamadas `/_anki/<método>` ao RPC. A senha do AnkiWeb
 nunca é guardada: o login devolve uma chave (hkey), armazenada no Keychain.
 
 A coleção fica em `Documentos/collection.anki2` (mídia em
@@ -56,7 +67,9 @@ Requisitos: macOS com Xcode 15+, [rustup](https://rustup.rs) e
 [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
 
 ```sh
-ios/build-rust.sh          # compila o núcleo Rust (alguns minutos na 1ª vez)
+brew install xcodegen swift-protobuf
+ios/build-web.sh           # telas web (precisa de node/yarn via receitas do just)
+ios/build-rust.sh          # núcleo Rust + código Swift gerado
 cd ios && xcodegen generate
 open AnkiiOS.xcodeproj
 ```

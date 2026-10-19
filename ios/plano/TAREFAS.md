@@ -19,11 +19,11 @@ Status: ⬜ pendente · 🟨 em andamento · ✅ concluída
 
 | # | Tarefa | Entrega |
 |---|---|---|
-| T01 ⬜ | RPC genérico na ponte | Ponte passa a usar `anki::backend::Backend`; novo `anki_bridge_rpc(service, method, bytes)`; comandos JSON atuais mantidos sobre o mesmo backend; testes |
-| T02 ⬜ | Protobuf no Swift | Geração de código swift-protobuf a partir de `proto/` no build; cliente `Rpc.swift` tipado |
-| T03 ⬜ | Host das páginas web | Build das páginas `ts/` no CI, embutidas no app; `WebPageView` com handler `_anki/` que roteia POSTs ao RPC |
-| T04 ⬜ | CI completo | Workflow: job Linux gera páginas web → job macOS embute, compila simulador/aparelho, roda testes Swift |
-| T05 ⬜ | Navegação base | Estrutura de abas/menus que as próximas etapas preenchem; tela de perfil/coleção |
+| T01 ✅ | RPC genérico na ponte | Ponte passa a usar `anki::backend::Backend`; novo `anki_bridge_rpc(service, method, bytes)`; comandos JSON atuais mantidos sobre o mesmo backend; testes |
+| T02 ✅ | Protobuf no Swift | Geração de código swift-protobuf a partir de `proto/` no build; cliente `Rpc.swift` tipado |
+| T03 ✅ | Host das páginas web | Build das páginas `ts/` no CI, embutidas no app; `WebPageView` com handler `_anki/` que roteia POSTs ao RPC |
+| T04 ✅ | CI completo | Workflow: job Linux gera páginas web → job macOS embute, compila simulador/aparelho, roda testes Swift |
+| T05 ✅ | Navegação base | Estrutura de abas/menus que as próximas etapas preenchem; tela de perfil/coleção |
 
 ## Etapa 1 — Estudo (spec 1 e 4)
 
