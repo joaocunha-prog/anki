@@ -56,6 +56,8 @@ mkdir -p "$OUT/proto"
 echo "Generated $(find "$OUT/proto" -name '*.pb.swift' | wc -l | tr -d ' ') files in $OUT/proto"
 
 if [ ! -f "$OUT/BackendServices.swift" ]; then
+    # build.rs only reruns when its inputs change, so make sure it does
+    touch "$ROOT/rslib/proto/swift.rs"
     cargo build -p anki_proto
 fi
 if [ ! -f "$OUT/BackendServices.swift" ]; then

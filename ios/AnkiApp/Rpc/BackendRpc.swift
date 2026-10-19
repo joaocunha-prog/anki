@@ -22,7 +22,7 @@ extension AnkiBackend {
     ) async throws -> Output {
         let output = try await rpc(service: service, method: method, input: input.serializedData())
         do {
-            return try Output(serializedData: output)
+            return try Output(serializedBytes: output)
         } catch {
             throw BackendError(kind: "PROTO_ERROR", message: "Invalid response from backend: \(error)")
         }

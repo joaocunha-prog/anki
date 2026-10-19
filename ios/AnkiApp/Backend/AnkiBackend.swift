@@ -33,6 +33,13 @@ struct BackendError: LocalizedError {
 final class AnkiBackend: @unchecked Sendable {
     private let handle: OpaquePointer
     private let queue = DispatchQueue(label: "anki.backend", qos: .userInitiated)
+    /// RPC calls may run concurrently, like the web pages' requests on desktop
+    /// (mediasrv.py): eg the deck options page polls latestProgress and calls
+    /// setWantsAbort while computeFsrsParams is still running. The backend
+    /// serializes access to the collection itself.
+    private let rpcQueue = DispatchQueue(
+        label: "anki.backend.rpc", qos: .userInitiated, attributes: .concurrent
+    )
 
     init() {
         let langs = Locale.preferredLanguages.joined(separator: ",")
@@ -62,11 +69,12 @@ final class AnkiBackend: @unchecked Sendable {
     /// Call a backend RPC method with protobuf-encoded input, returning the
     /// protobuf-encoded output. Indices are those of run_service_method; see
     /// BackendMethods (generated) and the typed wrappers in BackendServices.swift.
-    /// Shares the collection with the JSON commands, and runs on the same queue.
+    /// Shares the collection with the JSON commands. Unlike them, calls are not
+    /// queued behind each other (see rpcQueue).
     func rpc(service: UInt32, method: UInt32, input: Data) async throws -> Data {
         let handle = self.handle
         let (output, isError): (Data, Bool) = await withCheckedContinuation { continuation in
-            queue.async {
+            rpcQueue.async {
                 let buffer = input.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> AnkiBuffer in
                     let bytes = raw.bindMemory(to: UInt8.self)
                     return anki_bridge_rpc(handle, service, method, bytes.baseAddress, bytes.count)
@@ -81,13 +89,13 @@ final class AnkiBackend: @unchecked Sendable {
             }
         }
         if isError {
-            let error: Anki_Backend_BackendError
+            let decoded: Anki_Backend_BackendError
             do {
-                error = try Anki_Backend_BackendError(serializedData: output)
+                decoded = try Anki_Backend_BackendError(serializedBytes: output)
             } catch {
-                throw BackendError(kind: "PROTO_ERROR", message: "Invalid error from backend")
+                throw BackendError(kind: "PROTO_ERROR", message: "Invalid error from backend: \(error)")
             }
-            throw BackendError(protobuf: error)
+            throw BackendError(protobuf: decoded)
         }
         return output
     }
