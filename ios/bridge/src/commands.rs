@@ -1,21 +1,20 @@
 // Copyright: Ankitects Pty Ltd and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
-use std::thread::JoinHandle;
 
+use anki::backend::Backend;
 use anki::collection::Collection;
-use anki::collection::CollectionBuilder;
 use anki::decks::DeckId as NativeDeckId;
 use anki::error::AnkiError;
 use anki::error::Result;
 use anki::prelude::I18n;
 use anki::prelude::TimestampMillis;
 use anki::prelude::TimestampSecs;
-use anki::prelude::Usn;
+use anki::services::BackendCollectionService;
+use anki::services::BackendSyncService;
 use anki::services::CardRenderingService;
 use anki::services::CardsService;
 use anki::services::CollectionService;
@@ -23,15 +22,14 @@ use anki::services::DecksService;
 use anki::services::NotesService;
 use anki::services::NotetypesService;
 use anki::services::SchedulerService;
-use anki::sync::collection::normal::SyncActionRequired;
-use anki::sync::login::sync_login;
-use anki::sync::login::SyncAuth;
 use anki_proto::backend::backend_error::Kind as ErrorKind;
 use anki_proto::card_rendering::CompareAnswerRequest;
 use anki_proto::card_rendering::ExtractAvTagsRequest;
 use anki_proto::card_rendering::ExtractClozeForTypingRequest;
 use anki_proto::card_rendering::RenderExistingCardRequest;
 use anki_proto::cards::CardId;
+use anki_proto::collection::CloseCollectionRequest;
+use anki_proto::collection::OpenCollectionRequest;
 use anki_proto::decks::DeckId;
 use anki_proto::decks::DeckTreeNode;
 use anki_proto::decks::DeckTreeRequest;
@@ -48,15 +46,14 @@ use anki_proto::scheduler::CardAnswer;
 use anki_proto::scheduler::GetQueuedCardsRequest;
 use anki_proto::scheduler::SchedulingStates;
 use anki_proto::sync::sync_collection_response::ChangesRequired;
-use anki_proto::sync::SyncCollectionResponse;
-use futures::future::AbortHandle;
-use futures::future::Abortable;
-use reqwest::Client;
+use anki_proto::sync::FullUploadOrDownloadRequest;
+use anki_proto::sync::SyncAuth;
+use anki_proto::sync::SyncCollectionRequest;
+use anki_proto::sync::SyncLoginRequest;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
-use tokio::runtime::Runtime;
 
 use crate::render;
 use crate::render::AvItem;
@@ -78,6 +75,9 @@ pub enum Command {
         password: String,
         endpoint: Option<String>,
     },
+    /// Replies with `required`: "noChanges" if nothing needed syncing,
+    /// "normalSync" if changes were exchanged, or "fullSync"/"fullDownload"/
+    /// "fullUpload" if a one-way sync is needed first.
     Sync {
         auth: AuthJson,
         sync_media: bool,
@@ -133,16 +133,13 @@ pub struct AuthJson {
     pub endpoint: Option<String>,
 }
 
-impl TryFrom<AuthJson> for SyncAuth {
-    type Error = AnkiError;
-
-    fn try_from(auth: AuthJson) -> Result<Self> {
-        anki_proto::sync::SyncAuth {
+impl From<AuthJson> for SyncAuth {
+    fn from(auth: AuthJson) -> Self {
+        SyncAuth {
             hkey: auth.hkey,
             endpoint: auth.endpoint.filter(|e| !e.trim().is_empty()),
             io_timeout_secs: None,
         }
-        .try_into()
     }
 }
 
@@ -178,42 +175,39 @@ struct CurrentCard {
     type_answer: Option<TypeAnswer>,
 }
 
-struct MediaSync {
-    abort: AbortHandle,
-    thread: JoinHandle<Result<()>>,
-}
-
+/// The JSON commands and the protobuf RPC ([Bridge::rpc]) share a single
+/// [Backend], and so a single open collection, sync state and media sync.
 pub struct Bridge {
-    tr: I18n,
-    col: Mutex<Option<Collection>>,
+    backend: Backend,
     current: Mutex<Option<CurrentCard>>,
-    runtime: Runtime,
-    client: Client,
-    sync_abort: Mutex<Option<AbortHandle>>,
-    media_sync: Mutex<Option<MediaSync>>,
     backup_folder: Mutex<Option<String>>,
-    /// Error from the most recently finished media sync.
-    media_sync_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Bridge {
     pub fn new<S: AsRef<str>>(langs: &[S]) -> Self {
         Bridge {
-            tr: I18n::new(langs),
-            col: Mutex::new(None),
+            // as pylib/rsbridge does
+            backend: Backend::new(I18n::new(langs), false),
             current: Mutex::new(None),
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .expect("tokio runtime"),
-            // AnkiWeb's proxies only support http1
-            client: Client::builder().http1_only().build().expect("http client"),
-            sync_abort: Mutex::new(None),
-            media_sync: Mutex::new(None),
             backup_folder: Mutex::new(None),
-            media_sync_error: Default::default(),
         }
+    }
+
+    /// The backend shared by the JSON commands and the RPC.
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    /// Call a backend service method with protobuf-encoded input, exactly as
+    /// pylib/rsbridge does. On success, returns the encoded response; on
+    /// failure, an encoded [anki_proto::backend::BackendError].
+    pub fn rpc(
+        &self,
+        service: u32,
+        method: u32,
+        input: &[u8],
+    ) -> std::result::Result<Vec<u8>, Vec<u8>> {
+        self.backend.run_service_method(service, method, input)
     }
 
     /// Run a command encoded as JSON, returning a JSON reply.
@@ -235,17 +229,16 @@ impl Bridge {
                 return json!({"error": {"kind": "CARD_NOT_CURRENT", "message": "card is no longer current"}})
             }
         };
-        let err = err.into_protobuf(&self.tr);
+        let err = err.into_protobuf(self.backend.i18n());
         let kind = ErrorKind::try_from(err.kind)
             .map(|k| k.as_str_name())
             .unwrap_or("UNKNOWN");
         json!({"error": {"kind": kind, "message": err.message}})
     }
 
+    /// Ask a running login or (normal or full) sync to stop.
     pub fn abort_sync(&self) {
-        if let Some(handle) = lock(&self.sync_abort).take() {
-            handle.abort();
-        }
+        let _ = BackendSyncService::abort_sync(&self.backend);
     }
 
     pub fn run(&self, cmd: Command) -> std::result::Result<Value, BridgeError> {
@@ -257,23 +250,23 @@ impl Bridge {
                 backup_folder,
             } => {
                 *lock(&self.backup_folder) = backup_folder;
-                let mut guard = lock(&self.col);
-                if guard.is_none() {
-                    *guard = Some(
-                        CollectionBuilder::new(collection_path)
-                            .set_media_paths(media_folder, media_db)
-                            .set_tr(self.tr.clone())
-                            .build()?,
-                    );
+                match BackendCollectionService::open_collection(
+                    &self.backend,
+                    OpenCollectionRequest {
+                        collection_path,
+                        media_folder_path: media_folder,
+                        media_db_path: media_db,
+                    },
+                ) {
+                    // opening twice is harmless, eg if the RPC opened it first
+                    Ok(()) | Err(AnkiError::CollectionAlreadyOpen) => {}
+                    Err(err) => return Err(err.into()),
                 }
                 Value::Null
             }
             Command::Close => {
-                self.stop_media_sync();
                 lock(&self.current).take();
-                if let Some(col) = lock(&self.col).take() {
-                    col.close(None)?;
-                }
+                self.close_collection()?;
                 Value::Null
             }
             Command::Login {
@@ -282,12 +275,14 @@ impl Bridge {
                 endpoint,
             } => {
                 let endpoint = endpoint.filter(|e| !e.trim().is_empty());
-                let auth = self.abortable(sync_login(
-                    username,
-                    password,
-                    endpoint.clone(),
-                    self.client.clone(),
-                ))?;
+                let auth = BackendSyncService::sync_login(
+                    &self.backend,
+                    SyncLoginRequest {
+                        username,
+                        password,
+                        endpoint: endpoint.clone(),
+                    },
+                )?;
                 json!({ "hkey": auth.hkey, "endpoint": endpoint })
             }
             Command::Sync { auth, sync_media } => self.normal_sync(auth, sync_media)?,
@@ -296,19 +291,14 @@ impl Bridge {
                 upload,
                 server_media_usn,
             } => {
-                self.full_sync(auth.clone(), upload)?;
-                self.start_media_sync(auth, server_media_usn.map(Usn))?;
+                self.full_sync(auth.into(), upload, server_media_usn)?;
                 Value::Null
             }
             Command::SyncMedia { auth } => {
-                self.start_media_sync(auth, None)?;
+                BackendSyncService::sync_media(&self.backend, auth.into())?;
                 Value::Null
             }
-            Command::MediaSyncStatus => {
-                let active = self.media_sync_active();
-                let error = lock(&self.media_sync_error).clone();
-                json!({ "active": active, "error": error })
-            }
+            Command::MediaSyncStatus => self.media_sync_status(),
             Command::DeckTree => self.with_col(|col| {
                 let tree = DecksService::deck_tree(
                     col,
@@ -413,33 +403,32 @@ impl Bridge {
         })
     }
 
+    /// Run `func` with the backend's collection, failing if it is not open.
     fn with_col<T>(&self, func: impl FnOnce(&mut Collection) -> Result<T>) -> Result<T> {
-        func(self.lock_col()?.as_mut().unwrap())
+        self.backend.with_col(func)
     }
 
-    fn lock_col(&self) -> Result<MutexGuard<'_, Option<Collection>>> {
-        let guard = lock(&self.col);
-        if guard.is_none() {
-            return Err(AnkiError::CollectionNotOpen);
+    /// Close the collection if open, after stopping any media sync.
+    fn close_collection(&self) -> Result<()> {
+        match BackendCollectionService::close_collection(
+            &self.backend,
+            CloseCollectionRequest {
+                downgrade_to_schema11: false,
+            },
+        ) {
+            Ok(()) | Err(AnkiError::CollectionNotOpen) => Ok(()),
+            Err(err) => Err(err),
         }
-        Ok(guard)
-    }
-
-    /// Block on a future, allowing it to be interrupted with [Self::abort_sync].
-    fn abortable<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        let (handle, reg) = AbortHandle::new_pair();
-        lock(&self.sync_abort).replace(handle);
-        let result = self.runtime.block_on(Abortable::new(fut, reg));
-        lock(&self.sync_abort).take();
-        result.unwrap_or(Err(AnkiError::Interrupted))
     }
 
     // Studying
     ///////////////
 
     fn next_card(&self) -> Result<Value> {
-        let mut guard = self.lock_col()?;
-        let col = guard.as_mut().unwrap();
+        self.with_col(|col| self.next_card_inner(col))
+    }
+
+    fn next_card_inner(&self, col: &mut Collection) -> Result<Value> {
         let queued = SchedulerService::get_queued_cards(
             col,
             GetQueuedCardsRequest {
@@ -562,12 +551,21 @@ impl Bridge {
         card_id: i64,
         typed: Option<String>,
     ) -> std::result::Result<Value, BridgeError> {
+        self.with_col(|col| self.show_answer_inner(col, card_id, typed))?
+            .ok_or(BridgeError::CardNotCurrent)
+    }
+
+    /// Returns None if `card_id` is not the current card.
+    fn show_answer_inner(
+        &self,
+        col: &mut Collection,
+        card_id: i64,
+        typed: Option<String>,
+    ) -> Result<Option<Value>> {
         // lock order: col before current
-        let mut guard = self.lock_col()?;
-        let col = guard.as_mut().unwrap();
         let current = lock(&self.current);
         let Some(current) = current.as_ref().filter(|c| c.card_id == card_id) else {
-            return Err(BridgeError::CardNotCurrent);
+            return Ok(None);
         };
         let mut text = render::av_refs_to_play_buttons(&current.answer_text);
         let comparison = match &current.type_answer {
@@ -588,7 +586,9 @@ impl Bridge {
         };
         text = render::replace_type_tag(&text, &comparison);
         let html = CardRenderingService::encode_iri_paths(col, text.into())?.val;
-        Ok(json!({ "answerHtml": html, "answerAv": current.answer_av }))
+        Ok(Some(
+            json!({ "answerHtml": html, "answerAv": current.answer_av }),
+        ))
     }
 
     /// Work out what a `[[type:...]]` tag expects, as the desktop reviewer
@@ -623,7 +623,8 @@ impl Bridge {
         )?;
         let Some(idx) = names.vals.iter().position(|n| n == field) else {
             return Ok(Err(self
-                .tr
+                .backend
+                .i18n()
                 .studying_type_answer_unknown_field(field.to_string())
                 .into_owned()));
         };
@@ -706,27 +707,28 @@ impl Bridge {
     ///////////////
 
     fn normal_sync(&self, auth: AuthJson, sync_media: bool) -> Result<Value> {
-        let sync_auth: SyncAuth = auth.clone().try_into()?;
-        let output = {
-            let mut guard = self.lock_col()?;
-            let col = guard.as_mut().unwrap();
-            // Not abortable: an interrupted normal sync would need the open
-            // transaction to be rolled back, which only the backend can do.
-            // Network operations are bounded by the sync client's timeouts.
-            self.runtime
-                .block_on(col.normal_sync(sync_auth, self.client.clone()))?
-        };
-        let full_sync_required =
-            matches!(output.required, SyncActionRequired::FullSyncRequired { .. });
-        if !matches!(output.required, SyncActionRequired::NoChanges) {
+        // Abortable with [Self::abort_sync]: the backend rolls back the open
+        // transaction and tells the server to clean up. Media is synced in
+        // the background afterwards, unless a full sync is required.
+        let before = self.sync_state()?;
+        let resp = BackendSyncService::sync_collection(
+            &self.backend,
+            SyncCollectionRequest {
+                auth: Some(auth.into()),
+                sync_media,
+            },
+        )?;
+        let mut required = ChangesRequired::try_from(resp.required);
+        // The core reports a completed normal sync as "no changes"; tell
+        // Swift that changes were exchanged, so it reloads its screens.
+        if required == Ok(ChangesRequired::NoChanges) && self.sync_state()? != before {
+            required = Ok(ChangesRequired::NormalSync);
+        }
+        if required != Ok(ChangesRequired::NoChanges) {
             // the card may have been changed on another device
             lock(&self.current).take();
         }
-        let resp = SyncCollectionResponse::from(output);
-        if sync_media && !full_sync_required {
-            self.start_media_sync(auth, Some(Usn(resp.server_media_usn)))?;
-        }
-        let required = match ChangesRequired::try_from(resp.required) {
+        let required = match required {
             Ok(ChangesRequired::NoChanges) => "noChanges",
             Ok(ChangesRequired::NormalSync) => "normalSync",
             Ok(ChangesRequired::FullSync) => "fullSync",
@@ -742,78 +744,49 @@ impl Bridge {
         }))
     }
 
-    fn full_sync(&self, auth: AuthJson, upload: bool) -> Result<()> {
-        let auth: SyncAuth = auth.try_into()?;
-        self.stop_media_sync();
+    /// Changes when a normal sync exchanged data with the server.
+    fn sync_state(&self) -> Result<(TimestampMillis, i32)> {
+        self.with_col(|col| {
+            let meta = col.sync_meta()?;
+            Ok((meta.modified, meta.usn.0))
+        })
+    }
+
+    fn full_sync(&self, auth: SyncAuth, upload: bool, server_media_usn: Option<i32>) -> Result<()> {
         lock(&self.current).take();
-        let mut guard = self.lock_col()?;
         if !upload {
             // like the desktop, keep a copy of what is about to be replaced
             if let Some(folder) = lock(&self.backup_folder).clone() {
-                let col = guard.as_mut().unwrap();
-                if let Some(task) = col.maybe_backup(folder, true)? {
+                if let Some(task) = self.with_col(|col| col.maybe_backup(folder, true))? {
                     task.join().map_err(|_| invalid("backup failed"))??;
                 }
             }
         }
-        let col = guard.take().unwrap();
-        let mut builder = col.as_builder();
-        let result = if upload {
-            self.abortable(col.full_upload(auth, self.client.clone()))
-        } else {
-            self.abortable(col.full_download(auth, self.client.clone()))
-        };
-        // the collection is consumed by the sync, so reopen it regardless of outcome
-        *guard = Some(builder.build()?);
-        result
-    }
-
-    fn start_media_sync(&self, auth: AuthJson, server_usn: Option<Usn>) -> Result<()> {
-        if self.media_sync_active() {
-            return Ok(());
+        // The backend stops any media sync first, and reopens the collection
+        // regardless of the outcome. Abortable with [Self::abort_sync].
+        // Given a usn, it then starts the media sync itself.
+        BackendSyncService::full_upload_or_download(
+            &self.backend,
+            FullUploadOrDownloadRequest {
+                auth: Some(auth.clone()),
+                upload,
+                server_usn: server_media_usn,
+            },
+        )?;
+        if server_media_usn.is_none() {
+            BackendSyncService::sync_media(&self.backend, auth)?;
         }
-        let auth: SyncAuth = auth.try_into()?;
-        let (mgr, progress) =
-            self.with_col(|col| Ok((col.media()?, col.new_progress_handler())))?;
-        let (abort, reg) = AbortHandle::new_pair();
-        let handle = self.runtime.handle().clone();
-        let client = self.client.clone();
-        let error_slot = self.media_sync_error.clone();
-        lock(&error_slot).take();
-        let thread = std::thread::spawn(move || {
-            let fut = mgr.sync_media(progress, auth, client, server_usn);
-            let result = handle
-                .block_on(Abortable::new(fut, reg))
-                .unwrap_or(Err(AnkiError::Interrupted));
-            if let Err(err) = &result {
-                if !matches!(err, AnkiError::Interrupted) {
-                    lock(&error_slot).replace(err.to_string());
-                }
-            }
-            result
-        });
-        *lock(&self.media_sync) = Some(MediaSync { abort, thread });
         Ok(())
     }
 
-    fn media_sync_active(&self) -> bool {
-        let mut guard = lock(&self.media_sync);
-        match &*guard {
-            Some(sync) if !sync.thread.is_finished() => true,
-            Some(_) => {
-                let sync = guard.take().unwrap();
-                let _ = sync.thread.join();
-                false
-            }
-            None => false,
-        }
-    }
-
-    /// Abort any running media sync, and wait for it to finish.
-    fn stop_media_sync(&self) {
-        if let Some(sync) = lock(&self.media_sync).take() {
-            sync.abort.abort();
-            let _ = sync.thread.join();
+    /// Whether a media sync is running, and the error it failed with, if
+    /// any. A failure is reported by the first call after it finished.
+    fn media_sync_status(&self) -> Value {
+        match BackendSyncService::media_sync_status(&self.backend) {
+            Ok(status) => json!({ "active": status.active, "error": null }),
+            // stopped on request, eg by a full sync or by closing
+            Err(AnkiError::Interrupted) => json!({ "active": false, "error": null }),
+            Err(err) => json!({ "active": false, "error": err.message(self.backend.i18n()) }),
         }
     }
 }
@@ -835,10 +808,9 @@ fn deck_node_json(node: &DeckTreeNode) -> Value {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        self.stop_media_sync();
-        if let Some(col) = lock(&self.col).take() {
-            let _ = col.close(None);
-        }
+        // Stops any media sync, which holds its own clone of the backend, and
+        // would otherwise keep the collection open.
+        let _ = self.close_collection();
     }
 }
 
