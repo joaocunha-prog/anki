@@ -2,6 +2,12 @@ name: iOS
 
 # Builds the iOS app (ios/) and its Rust core. Produces an unsigned .ipa
 # artifact that can be signed and sideloaded (see ios/README.md).
+#
+# - web: compiles Anki's web pages (ts/) on Linux with ios/build-web.sh and
+#   uploads them for the app bundle.
+# - bridge-tests: tests the Rust bridge (ios/bridge) on Linux.
+# - build: on macOS, builds the Rust core, generates the Swift protobuf code,
+#   embeds the web pages and builds the app for simulator and device.
 
 on:
   workflow_dispatch:
@@ -10,14 +16,30 @@ on:
       - "ios/**"
       - "rslib/**"
       - "proto/**"
+      - "ts/**"
+      - "sass/**"
+      - "ftl/**"
+      - "build/**"
+      - "qt/aqt/data/web/**"
       - "Cargo.lock"
+      - "package.json"
+      - "yarn.lock"
+      - "justfile"
       - ".github/workflows/ios.yml"
   pull_request:
     paths:
       - "ios/**"
       - "rslib/**"
       - "proto/**"
+      - "ts/**"
+      - "sass/**"
+      - "ftl/**"
+      - "build/**"
+      - "qt/aqt/data/web/**"
       - "Cargo.lock"
+      - "package.json"
+      - "yarn.lock"
+      - "justfile"
       - ".github/workflows/ios.yml"
 
 concurrency:
@@ -27,7 +49,65 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  N2_OUTPUT_PROGRESS: "1"
+  N2_OUTPUT_SUCCESS: "1"
+
 jobs:
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v4
+
+      - name: Fetch translations
+        run: git submodule update --init --depth 1 ftl/core-repo ftl/qt-repo
+
+      - name: Restore cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Reuse the main CI's build output (downloaded node, node_modules,
+      # compiled tools) when one is available; never saved from here.
+      - name: Restore build output cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: out
+          key: build-Linux-main-${{ github.run_id }}
+          restore-keys: |
+            build-Linux-main-
+            build-Linux-
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-anki
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
+
+      - name: Build web pages
+        run: bash ios/build-web.sh
+
+      - name: Check web pages
+        run: |
+          test -d ios/build/web
+          test -n "$(ls -A ios/build/web)"
+          du -sh ios/build/web
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: ios-web
+          path: ios/build/web/
+          if-no-files-found: error
+          retention-days: 7
+
   bridge-tests:
     runs-on: ubuntu-24.04
     steps:
@@ -56,8 +136,15 @@ jobs:
 
   build:
     runs-on: macos-15
+    needs: web
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v4
+
+      - name: Download web pages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: ios-web
+          path: ios/build/web
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
@@ -67,25 +154,42 @@ jobs:
             target
           key: ios-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
+      # swift-protobuf provides protoc-gen-swift, for ios/gen-swift-protos.sh.
+      - name: Install tools
+        run: |
+          brew install xcodegen swift-protobuf
+          protoc-gen-swift --version
+
+      # Also writes out/ios/generated/BackendServices.swift.
       - name: Build Rust core
-        run: TARGETS="aarch64-apple-ios aarch64-apple-ios-sim" ios/build-rust.sh
+        run: TARGETS="aarch64-apple-ios aarch64-apple-ios-sim" SKIP_SWIFT_PROTOS=1 ios/build-rust.sh
+
+      - name: Generate Swift protobuf code
+        run: |
+          bash ios/gen-swift-protos.sh
+          test -f out/ios/generated/BackendServices.swift
 
       - name: Generate Xcode project
-        run: |
-          brew install xcodegen
-          cd ios && xcodegen generate
+        run: cd ios && xcodegen generate
 
       - name: Build for simulator
         run: |
           xcodebuild -project ios/AnkiiOS.xcodeproj -scheme AnkiiOS \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath ios/build/sim ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath ios/build/sim -clonedSourcePackagesDirPath ios/build/spm \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
 
       - name: Build for device (unsigned)
         run: |
           xcodebuild -project ios/AnkiiOS.xcodeproj -scheme AnkiiOS -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath ios/build/device CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath ios/build/device -clonedSourcePackagesDirPath ios/build/spm \
+            CODE_SIGNING_ALLOWED=NO build
+
+      - name: Package .ipa
+        run: |
+          app=ios/build/device/Build/Products/Release-iphoneos/AnkiiOS.app
+          test -d "$app/web" || { echo "web pages missing from $app" >&2; exit 1; }
           cd ios/build
           rm -rf Payload && mkdir Payload
           cp -R device/Build/Products/Release-iphoneos/AnkiiOS.app Payload/
@@ -95,4 +199,5 @@ jobs:
         with:
           name: Anki-iOS-unsigned
           path: ios/build/Anki-unsigned.ipa
+          if-no-files-found: error
           retention-days: 30

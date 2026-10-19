@@ -7,6 +7,11 @@
 #
 # Set TARGETS to limit the architectures built, eg for Apple Silicon only:
 #   TARGETS="aarch64-apple-ios aarch64-apple-ios-sim" ios/build-rust.sh
+#
+# Building the core also writes out/ios/generated/BackendServices.swift (from
+# rslib/proto/build.rs). Afterwards, if protoc-gen-swift is installed
+# (`brew install swift-protobuf`), ios/gen-swift-protos.sh is run to generate
+# the Swift message types too; set SKIP_SWIFT_PROTOS=1 to skip that step.
 
 set -euo pipefail
 
@@ -30,6 +35,12 @@ if [ ! -x "$PROTOC_DIR/bin/protoc" ]; then
         https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-osx-universal_binary.zip
     echo "99ea004549c139f46da5638187a85bbe422d78939be0fa01af1aa8ab672e395f  $PROTOC_DIR/protoc.zip" | shasum -a 256 -c
     (cd "$PROTOC_DIR" && unzip -qo protoc.zip && rm protoc.zip)
+fi
+
+# The Swift service wrappers are written by anki_proto's build script, which
+# cargo will not rerun on its own if only its output was deleted.
+if [ ! -f "$ROOT/out/ios/generated/BackendServices.swift" ]; then
+    touch "$ROOT/rslib/proto/build.rs"
 fi
 
 device_libs=()
@@ -56,3 +67,14 @@ if [ ${#sim_libs[@]} -gt 0 ]; then
 fi
 xcodebuild -create-xcframework "${args[@]}" -output "$OUT/AnkiBridge.xcframework"
 echo "Created $OUT/AnkiBridge.xcframework"
+
+if [ "${SKIP_SWIFT_PROTOS:-0}" != 1 ]; then
+    if [ ! -f "$ROOT/ios/gen-swift-protos.sh" ]; then
+        echo "ios/gen-swift-protos.sh not found; skipping Swift protobuf generation"
+    elif command -v protoc-gen-swift >/dev/null || [ -n "${PROTOC_GEN_SWIFT:-}" ]; then
+        bash "$ROOT/ios/gen-swift-protos.sh"
+    else
+        echo "protoc-gen-swift not found (brew install swift-protobuf);" \
+            "run ios/gen-swift-protos.sh before building the app"
+    fi
+fi
