@@ -3,6 +3,7 @@
 
 import AnkiBridge
 import Foundation
+import SwiftProtobuf
 
 /// An error reported by the Rust core.
 struct BackendError: LocalizedError {
@@ -14,6 +15,17 @@ struct BackendError: LocalizedError {
     var isInterrupted: Bool { kind == "INTERRUPTED" }
     /// The card on screen was changed elsewhere (eg by a sync), and must be reloaded.
     var isCardNotCurrent: Bool { kind == "CARD_NOT_CURRENT" }
+
+    /// Build from the protobuf BackendError returned by a failed RPC call.
+    init(protobuf error: Anki_Backend_BackendError) {
+        kind = BackendErrorKinds.names[error.kind.rawValue] ?? "UNKNOWN"
+        message = error.message
+    }
+
+    init(kind: String, message: String) {
+        self.kind = kind
+        self.message = message
+    }
 }
 
 /// Thin async wrapper around the C/JSON bridge. Commands are executed one at
@@ -45,6 +57,39 @@ final class AnkiBackend: @unchecked Sendable {
     /// Interrupt a login or full sync. Safe to call while a command is running.
     func abortSync() {
         anki_bridge_abort_sync(handle)
+    }
+
+    /// Call a backend RPC method with protobuf-encoded input, returning the
+    /// protobuf-encoded output. Indices are those of run_service_method; see
+    /// BackendMethods (generated) and the typed wrappers in BackendServices.swift.
+    /// Shares the collection with the JSON commands, and runs on the same queue.
+    func rpc(service: UInt32, method: UInt32, input: Data) async throws -> Data {
+        let handle = self.handle
+        let (output, isError): (Data, Bool) = await withCheckedContinuation { continuation in
+            queue.async {
+                let buffer = input.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> AnkiBuffer in
+                    let bytes = raw.bindMemory(to: UInt8.self)
+                    return anki_bridge_rpc(handle, service, method, bytes.baseAddress, bytes.count)
+                }
+                var output = Data()
+                if let data = buffer.data, buffer.len > 0 {
+                    output = Data(bytes: data, count: buffer.len)
+                }
+                let isError = buffer.is_error
+                anki_bridge_free_buffer(buffer)
+                continuation.resume(returning: (output, isError))
+            }
+        }
+        if isError {
+            let error: Anki_Backend_BackendError
+            do {
+                error = try Anki_Backend_BackendError(serializedData: output)
+            } catch {
+                throw BackendError(kind: "PROTO_ERROR", message: "Invalid error from backend")
+            }
+            throw BackendError(protobuf: error)
+        }
+        return output
     }
 
     private func callRaw(_ command: [String: Any]) async throws -> Data {
