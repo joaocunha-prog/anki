@@ -24,9 +24,9 @@ struct RootView: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        NavigationStack {
-            DeckListView()
-        }
-        .appPresentations(model)
+        // Each tab owns its NavigationStack; app-wide alerts, sync prompts and
+        // the login screen are still presented from the root.
+        MainTabView()
+            .appPresentations(model)
     }
 }
